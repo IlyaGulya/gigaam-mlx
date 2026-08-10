@@ -101,14 +101,26 @@ class RotaryMultiHeadAttention(nn.Module):
     ) -> mx.array:
         B, T, D = query.shape
 
-        # Apply RoPE to raw input before linear projections
-        q_raw = mx.transpose(query.reshape(B, T, self.h, self.d_k), (1, 0, 2, 3))
-        k_raw = mx.transpose(key.reshape(B, T, self.h, self.d_k), (1, 0, 2, 3))
-        v_raw = mx.transpose(value.reshape(B, T, self.h, self.d_k), (1, 0, 2, 3))
-        q_raw, k_raw = _apply_rotary(q_raw, k_raw, cos, sin)
-        query = mx.transpose(q_raw, (1, 0, 2, 3)).reshape(B, T, D)
-        key = mx.transpose(k_raw, (1, 0, 2, 3)).reshape(B, T, D)
-        value = mx.transpose(v_raw, (1, 0, 2, 3)).reshape(B, T, D)
+        # Apply RoPE to raw input before linear projections. The rotation is a
+        # per-position reshape/multiply, so it can be done directly on (B, T, D)
+        # without routing through a (T, B, H, D) transpose and back.
+        cos_b = mx.broadcast_to(
+            cos[:T].reshape(1, T, 1, self.d_k), (1, T, self.h, self.d_k)
+        ).reshape(1, T, D)
+        sin_b = mx.broadcast_to(
+            sin[:T].reshape(1, T, 1, self.d_k), (1, T, self.h, self.d_k)
+        ).reshape(1, T, D)
+
+        def rope(x: mx.array) -> mx.array:
+            h = x.reshape(B, T, self.h, self.d_k)
+            return x * cos_b + _rotate_half(h).reshape(B, T, D) * sin_b
+
+        # Only q and k are rotated; v is passed through untouched. In
+        # self-attention q and k are the same tensor, so rotate once.
+        if query is key:
+            query = key = rope(query)
+        else:
+            query, key = rope(query), rope(key)
 
         # Project and compute attention
         q = mx.transpose(self.linear_q(query).reshape(B, T, self.h, self.d_k), (0, 2, 1, 3))
@@ -143,10 +155,8 @@ class ConformerLayer(nn.Module):
         x = self.feed_forward1(self.norm_feed_forward1(x))
         residual = residual + x * self.fc_factor
 
-        x = self.self_attn(
-            self.norm_self_att(residual), self.norm_self_att(residual),
-            self.norm_self_att(residual), cos, sin,
-        )
+        normed = self.norm_self_att(residual)
+        x = self.self_attn(normed, normed, normed, cos, sin)
         residual = residual + x
 
         x = self.conv(self.norm_conv(residual))
