@@ -346,15 +346,20 @@ class GigaAMMLX(nn.Module):
         state: Optional[Tuple[mx.array, mx.array]] = None
         last_label: Optional[mx.array] = None
 
+        # The encoder half of the joint does not depend on decoder state, so
+        # project every frame once here. Spans restart after each emission,
+        # so otherwise the same frames get re-projected many times over.
+        enc_p = self.joint.enc_proj(enc.T)  # (T, joint_hidden)
+
         t = 0
         while t < seq_len:
             g, new_state = self.decoder.predict(last_label, state)
+            pred_p = self.joint.pred_proj(g)[0, 0]  # (joint_hidden,)
 
             # Scan ahead over frames while the decoder state stays fixed.
             span = min(lookahead, seq_len - t)
-            f_span = mx.expand_dims(enc[:, t:t + span].T, axis=0)  # (1, span, C)
-            logits = self.joint(f_span, g, normalize=False)  # (1, span, 1, V)
-            preds = mx.argmax(logits[0, :, 0, :], axis=-1).tolist()  # one sync
+            logits = self.joint.out(nn.relu(enc_p[t:t + span] + pred_p))
+            preds = mx.argmax(logits, axis=-1).tolist()  # one sync
 
             for offset, k in enumerate(preds):
                 if k != blank_id:
@@ -371,10 +376,10 @@ class GigaAMMLX(nn.Module):
             last_label = mx.array([[hyp[-1]]])
 
             # Same frame may emit several symbols; those need real steps.
-            f = mx.expand_dims(enc[:, t:t + 1].T, axis=0)
             for _ in range(max_symbols - 1):
                 g, new_state = self.decoder.predict(last_label, state)
-                k = mx.argmax(self.joint(f, g, normalize=False)[0, 0, 0, :]).item()
+                pred_p = self.joint.pred_proj(g)[0, 0]
+                k = mx.argmax(self.joint.out(nn.relu(enc_p[t] + pred_p))).item()
                 if k == blank_id:
                     break
                 hyp.append(int(k))
