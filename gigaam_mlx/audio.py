@@ -40,23 +40,40 @@ def load_audio(path: str, sr: int = SAMPLE_RATE) -> np.ndarray:
     return np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32) / 32768.0
 
 
+_MEL_CACHE: dict = {}
+
+
+def _mel_basis(sr: int):
+    """Mel filterbank and analysis window, built once per sample rate.
+
+    librosa.feature.melspectrogram rebuilds both on every call, which is the
+    bulk of the cost when transcribing hundreds of short chunks.
+    """
+    cached = _MEL_CACHE.get(sr)
+    if cached is None:
+        fb = librosa.filters.mel(
+            sr=sr, n_fft=N_FFT, n_mels=N_MELS, htk=True, norm=None
+        ).astype(np.float32)
+        window = np.hanning(WIN_LENGTH + 1)[:-1].astype(np.float32)
+        cached = (fb, window)
+        _MEL_CACHE[sr] = cached
+    return cached
+
+
 def compute_mel(audio: np.ndarray, sr: int = SAMPLE_RATE) -> np.ndarray:
     """
     Compute log-mel spectrogram matching GigaAM's FeatureExtractor.
 
     Returns (T, 64) float32 array.
     """
-    mel = librosa.feature.melspectrogram(
-        y=audio, sr=sr,
-        n_mels=N_MELS,
-        n_fft=N_FFT,
-        hop_length=HOP_LENGTH,
-        win_length=WIN_LENGTH,
-        center=False,
-        htk=True,
-        norm=None,
-        power=2.0,
-    )
+    filters, window = _mel_basis(sr)
+
+    # Equivalent to librosa.feature.melspectrogram(center=False, power=2.0),
+    # but without rebuilding the filterbank and window on each call.
+    frames = np.lib.stride_tricks.sliding_window_view(audio, WIN_LENGTH)
+    frames = frames[::HOP_LENGTH]
+    spectrum = np.abs(np.fft.rfft(frames * window, n=N_FFT, axis=-1)) ** 2
+    mel = filters @ spectrum.T
     return np.log(np.clip(mel, 1e-9, 1e9)).astype(np.float32).T  # (T, n_mels)
 
 
