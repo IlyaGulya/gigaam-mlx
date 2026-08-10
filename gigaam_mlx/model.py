@@ -238,11 +238,17 @@ class RNNTJoint(nn.Module):
         self.pred_proj = nn.Linear(pred_hidden, joint_hidden)
         self.out = nn.Linear(joint_hidden, num_classes)
 
-    def __call__(self, enc: mx.array, pred: mx.array) -> mx.array:
+    def __call__(
+        self, enc: mx.array, pred: mx.array, normalize: bool = True
+    ) -> mx.array:
         e = mx.expand_dims(self.enc_proj(enc), axis=2)
         p = mx.expand_dims(self.pred_proj(pred), axis=1)
         joint = nn.relu(e + p)
         logits = self.out(joint)
+        if not normalize:
+            # Greedy decoding only takes an argmax, which log_softmax leaves
+            # unchanged — so skip the reduction over all 1025 classes.
+            return logits
         return logits - mx.logsumexp(logits, axis=-1, keepdims=True)
 
 
@@ -320,7 +326,20 @@ class GigaAMMLX(nn.Module):
 
         A per-step sync costs ~0.72ms against ~0.011ms of actual compute, so
         collapsing the blank runs is worth far more than the redundant joints.
+
+        The whole loop runs on the CPU stream. The work per step is tiny — a
+        320-unit LSTM cell and a 320->1025 matmul — so the GPU round-trip
+        dominates it: the same step costs ~1.08ms on the GPU stream against
+        ~0.34ms on the CPU one. Unified memory means the encoder output needs
+        no copy to be read here, and skipping log_softmax (argmax is invariant
+        to it) drops a reduction over 1025 classes from every step.
         """
+        with mx.stream(mx.cpu):
+            return self._rnnt_decode_impl(encoded, seq_len, max_symbols, lookahead)
+
+    def _rnnt_decode_impl(
+        self, encoded: mx.array, seq_len: int, max_symbols: int, lookahead: int
+    ) -> List[int]:
         enc = encoded[0]  # (C, T)
         blank_id = self.decoder.blank_id
         hyp: List[int] = []
@@ -334,7 +353,7 @@ class GigaAMMLX(nn.Module):
             # Scan ahead over frames while the decoder state stays fixed.
             span = min(lookahead, seq_len - t)
             f_span = mx.expand_dims(enc[:, t:t + span].T, axis=0)  # (1, span, C)
-            logits = self.joint(f_span, g)  # (1, span, 1, V)
+            logits = self.joint(f_span, g, normalize=False)  # (1, span, 1, V)
             preds = mx.argmax(logits[0, :, 0, :], axis=-1).tolist()  # one sync
 
             for offset, k in enumerate(preds):
@@ -355,7 +374,7 @@ class GigaAMMLX(nn.Module):
             f = mx.expand_dims(enc[:, t:t + 1].T, axis=0)
             for _ in range(max_symbols - 1):
                 g, new_state = self.decoder.predict(last_label, state)
-                k = mx.argmax(self.joint(f, g)[0, 0, 0, :]).item()
+                k = mx.argmax(self.joint(f, g, normalize=False)[0, 0, 0, :]).item()
                 if k == blank_id:
                     break
                 hyp.append(int(k))
