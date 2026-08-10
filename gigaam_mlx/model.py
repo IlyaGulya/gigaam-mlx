@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 
 # MLX keeps freed Metal buffers in an unbounded pool by default, so chunked
@@ -16,6 +17,10 @@ import mlx.nn as nn
 # Peak usage within a single chunk is ~1.7GB, so a 2GB cache preserves buffer
 # reuse inside a chunk while dropping the cross-chunk accumulation.
 DEFAULT_CACHE_LIMIT = 2 * 1024**3
+
+
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-x))
 
 
 # ── Rotary Positional Encoding ──────────────────────────────────
@@ -327,66 +332,102 @@ class GigaAMMLX(nn.Module):
         A per-step sync costs ~0.72ms against ~0.011ms of actual compute, so
         collapsing the blank runs is worth far more than the redundant joints.
 
-        The whole loop runs on the CPU stream. The work per step is tiny — a
-        320-unit LSTM cell and a 320->1025 matmul — so the GPU round-trip
-        dominates it: the same step costs ~1.08ms on the GPU stream against
-        ~0.34ms on the CPU one. Unified memory means the encoder output needs
-        no copy to be read here, and skipping log_softmax (argmax is invariant
-        to it) drops a reduction over 1025 classes from every step.
-        """
-        with mx.stream(mx.cpu):
-            return self._rnnt_decode_impl(encoded, seq_len, max_symbols, lookahead)
+        The loop itself runs in NumPy rather than MLX. Its per-step work is a
+        320-unit LSTM cell and a 320->1025 matmul, which is far too small to
+        pay for a framework dispatch: the same step costs ~1.08ms on the MLX
+        GPU stream, ~0.34ms on the MLX CPU stream, and ~0.06ms in plain NumPy.
+        What remained after moving off the GPU was MLX's own scheduling and
+        graph-building overhead, so the loop leaves MLX entirely. Only the
+        encoder projection stays on the GPU, where it is one batched matmul.
 
-    def _rnnt_decode_impl(
-        self, encoded: mx.array, seq_len: int, max_symbols: int, lookahead: int
-    ) -> List[int]:
-        enc = encoded[0]  # (C, T)
+        Skipping log_softmax also drops a reduction over 1025 classes from
+        every step — greedy decoding takes an argmax, which is invariant to it.
+        """
         blank_id = self.decoder.blank_id
-        hyp: List[int] = []
-        state: Optional[Tuple[mx.array, mx.array]] = None
-        last_label: Optional[mx.array] = None
+        w = self._decode_weights()
 
         # The encoder half of the joint does not depend on decoder state, so
-        # project every frame once here. Spans restart after each emission,
-        # so otherwise the same frames get re-projected many times over.
-        enc_p = self.joint.enc_proj(enc.T)  # (T, joint_hidden)
+        # project every frame once, on the GPU, before dropping into NumPy.
+        # Spans restart after each emission, so otherwise the same frames get
+        # re-projected many times over.
+        enc_p_mx = self.joint.enc_proj(encoded[0].T)  # (T, joint_hidden)
+        mx.eval(enc_p_mx)
+        enc_p = np.array(enc_p_mx, copy=False)
+
+        H = self.decoder.pred_hidden
+        hyp: List[int] = []
+        h = np.zeros(H, dtype=np.float32)
+        c = np.zeros(H, dtype=np.float32)
+        emb = np.zeros(H, dtype=np.float32)  # zeros stand in for "no label yet"
+
+        def predict(emb_vec, h, c):
+            """One LSTM step; returns (pred_proj(g), new_h, new_c)."""
+            z = emb_vec @ w["Wx"] + w["b"] + h @ w["Wh"]
+            i = _sigmoid(z[:H])
+            f = _sigmoid(z[H:2 * H])
+            g = np.tanh(z[2 * H:3 * H])
+            o = _sigmoid(z[3 * H:])
+            c_new = f * c + i * g
+            h_new = o * np.tanh(c_new)
+            return h_new @ w["Wp"] + w["bp"], h_new, c_new
 
         t = 0
+        pred_p, h_next, c_next = predict(emb, h, c)
         while t < seq_len:
-            g, new_state = self.decoder.predict(last_label, state)
-            pred_p = self.joint.pred_proj(g)[0, 0]  # (joint_hidden,)
-
             # Scan ahead over frames while the decoder state stays fixed.
             span = min(lookahead, seq_len - t)
-            logits = self.joint.out(nn.relu(enc_p[t:t + span] + pred_p))
-            preds = mx.argmax(logits, axis=-1).tolist()  # one sync
+            block = enc_p[t:t + span] + pred_p
+            np.maximum(block, 0, out=block)
+            preds = np.argmax(block @ w["Wo"] + w["bo"], axis=-1)
 
-            for offset, k in enumerate(preds):
-                if k != blank_id:
-                    break
-            else:
+            nz = np.flatnonzero(preds != blank_id)
+            if nz.size == 0:
                 # Entire span was blank — state unchanged, skip it wholesale.
                 t += span
                 continue
 
-            # Frames before `offset` were blank; consume them and emit here.
+            # Frames before the first non-blank were blank; emit at that frame.
+            offset = int(nz[0])
             t += offset
-            hyp.append(int(k))
-            state = new_state
-            last_label = mx.array([[hyp[-1]]])
+            k = int(preds[offset])
+            hyp.append(k)
+            h, c = h_next, c_next
+            emb = w["embed"][k]
+            pred_p, h_next, c_next = predict(emb, h, c)
 
             # Same frame may emit several symbols; those need real steps.
             for _ in range(max_symbols - 1):
-                g, new_state = self.decoder.predict(last_label, state)
-                pred_p = self.joint.pred_proj(g)[0, 0]
-                k = mx.argmax(self.joint.out(nn.relu(enc_p[t] + pred_p))).item()
+                logits = np.maximum(enc_p[t] + pred_p, 0) @ w["Wo"] + w["bo"]
+                k = int(np.argmax(logits))
                 if k == blank_id:
                     break
-                hyp.append(int(k))
-                state = new_state
-                last_label = mx.array([[hyp[-1]]])
+                hyp.append(k)
+                h, c = h_next, c_next
+                emb = w["embed"][k]
+                pred_p, h_next, c_next = predict(emb, h, c)
             t += 1
         return hyp
+
+    def _decode_weights(self) -> dict:
+        """NumPy copies of the RNNT decoder/joint weights, built once."""
+        cached = getattr(self, "_decode_w", None)
+        if cached is not None:
+            return cached
+        lstm = self.decoder.lstm
+        w = {
+            # MLX stores LSTM gates as (i, f, g, o) along the first axis, and
+            # its Linear weights as (out, in) — transpose for x @ W.
+            "Wx": np.array(lstm.Wx).T.copy(),
+            "Wh": np.array(lstm.Wh).T.copy(),
+            "b": np.array(lstm.bias),
+            "embed": np.array(self.decoder.embed.weight),
+            "Wp": np.array(self.joint.pred_proj.weight).T.copy(),
+            "bp": np.array(self.joint.pred_proj.bias),
+            "Wo": np.array(self.joint.out.weight).T.copy(),
+            "bo": np.array(self.joint.out.bias),
+        }
+        self._decode_w = w
+        return w
 
     # Keep backward compat
     def ctc_decode(self, encoded: mx.array, seq_len: int) -> List[int]:
