@@ -7,6 +7,17 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
+# MLX keeps freed Metal buffers in an unbounded pool by default, so chunked
+# transcription accumulates them for the whole file: ~0.25GB per chunk, 27GB
+# by chunk 100 of a 52-minute recording. That memory is reclaimable rather
+# than leaked, but it counts toward the process footprint and drives system
+# memory pressure until something else needs it.
+#
+# Peak usage within a single chunk is ~1.7GB, so a 2GB cache preserves buffer
+# reuse inside a chunk while dropping the cross-chunk accumulation.
+DEFAULT_CACHE_LIMIT = 2 * 1024**3
+
+
 # ── Rotary Positional Encoding ──────────────────────────────────
 
 def create_rotary_pe(

@@ -1,6 +1,6 @@
 """GigaAM-MLX: Fast Russian speech recognition on Apple Silicon."""
 
-from .model import GigaAMMLX
+from .model import GigaAMMLX, DEFAULT_CACHE_LIMIT
 from .audio import load_audio, compute_mel
 from .transcribe import transcribe_file
 
@@ -12,13 +12,21 @@ REPOS = {
 }
 
 
-def load_model(model_type: str = "ctc", repo_id: str | None = None):
+def load_model(
+    model_type: str = "ctc",
+    repo_id: str | None = None,
+    cache_limit: int | None = DEFAULT_CACHE_LIMIT,
+):
     """
     Load GigaAM MLX model and tokenizer.
 
     Args:
         model_type: "ctc" (fast) or "rnnt" (higher quality)
         repo_id: HuggingFace repo ID or local path (auto-selected if None)
+        cache_limit: Cap MLX's buffer cache, in bytes. Applied here rather
+            than in transcribe_file so that callers driving model.encode /
+            model.decode directly are covered too. Pass None to leave MLX's
+            default (unbounded) behaviour untouched.
 
     Returns:
         tuple: (model, tokenizer)
@@ -29,6 +37,9 @@ def load_model(model_type: str = "ctc", repo_id: str | None = None):
 
     if model_type not in ("ctc", "rnnt"):
         raise ValueError(f"model_type must be 'ctc' or 'rnnt', got '{model_type}'")
+
+    if cache_limit is not None:
+        mx.set_cache_limit(cache_limit)
 
     if repo_id is None:
         repo_id = REPOS[model_type]

@@ -9,7 +9,7 @@ import mlx.core as mx
 import numpy as np
 
 from .audio import compute_mel, load_audio, split_audio
-from .model import GigaAMMLX
+from .model import DEFAULT_CACHE_LIMIT, GigaAMMLX
 
 
 def format_srt_time(seconds: float) -> str:
@@ -38,6 +38,7 @@ def transcribe_file(
     model_type: str = "ctc",
     repo_id: Optional[str] = None,
     verbose: bool = True,
+    cache_limit: Optional[int] = DEFAULT_CACHE_LIMIT,
 ) -> list[dict]:
     """
     Transcribe an audio or video file.
@@ -49,6 +50,8 @@ def transcribe_file(
         model_type: "ctc" (fast) or "rnnt" (higher quality)
         repo_id: HuggingFace repo ID (auto-selected if None)
         verbose: Print progress
+        cache_limit: Cap MLX's buffer cache, in bytes. Pass None to leave
+            MLX's default (unbounded) behaviour untouched.
 
     Returns:
         List of segments with 'start', 'end', 'text' keys
@@ -59,7 +62,12 @@ def transcribe_file(
 
     if model is None or tokenizer is None:
         from . import load_model
-        model, tokenizer = load_model(model_type=model_type, repo_id=repo_id)
+        model, tokenizer = load_model(
+            model_type=model_type, repo_id=repo_id, cache_limit=cache_limit
+        )
+    elif cache_limit is not None:
+        # Pre-loaded model, so load_model did not run — apply the cap here.
+        mx.set_cache_limit(cache_limit)
 
     log(f"Loading audio: {os.path.basename(audio_path)}")
     audio = load_audio(audio_path)
@@ -113,6 +121,10 @@ def main():
     parser.add_argument("--model", default=None, help="HF repo ID or local model path")
     parser.add_argument("--format", choices=["srt", "txt", "both"], default="both")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--cache-limit-gb", type=float, default=DEFAULT_CACHE_LIMIT / 1024**3,
+        help="Cap MLX's buffer cache in GB (0 disables the cap)",
+    )
     args = parser.parse_args()
 
     input_path = os.path.abspath(args.input)
@@ -128,6 +140,9 @@ def main():
         model_type=args.model_type,
         repo_id=args.model,
         verbose=not args.quiet,
+        cache_limit=(
+            int(args.cache_limit_gb * 1024**3) if args.cache_limit_gb > 0 else None
+        ),
     )
 
     if not segments:
