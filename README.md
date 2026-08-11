@@ -7,71 +7,27 @@
 [![HuggingFace RNNT](https://img.shields.io/badge/%F0%9F%A4%97-RNNT_Model-yellow)](https://huggingface.co/aystream/GigaAM-v3-e2e-rnnt-mlx)
 [![arXiv](https://img.shields.io/badge/arXiv-2506.01192-b31b1b.svg)](https://arxiv.org/abs/2506.01192)
 
-> Fast Russian speech recognition on Apple Silicon — **up to 330x realtime**
-
-MLX port of [GigaAM-v3](https://github.com/salute-developers/GigaAM) (220M params, Conformer + CTC/RNNT) by Salute Developers. Produces **punctuated, normalized text** directly. No PyTorch required.
-
-> **This is a fork of [aystream/gigaam-mlx](https://github.com/aystream/gigaam-mlx)** that bounds MLX's
-> buffer cache and speeds up long-file transcription by ~4x. Transcripts are byte-identical to
-> upstream's. See [Changes in this fork](#changes-in-this-fork).
-
-<p align="center">
-  <img src="assets/benchmark.svg" alt="Benchmark comparison" width="600">
-</p>
-
-## Quick Start
-
-```bash
-pip install git+https://github.com/IlyaGulya/gigaam-mlx.git
-```
-
-```python
-from gigaam_mlx import load_model, transcribe
-
-model, tokenizer = load_model()  # auto-downloads from HuggingFace
-text = transcribe(model, tokenizer, "meeting.wav")
-print(text)
-```
-
-## CLI
-
-```bash
-# Transcribe any audio/video file (CTC — fast, default)
-gigaam-mlx recording.mkv
-
-# Use RNNT for higher quality
-gigaam-mlx recording.mkv --model-type rnnt
-
-# Output subtitles
-gigaam-mlx call.wav --output-dir ./transcripts --format srt
-```
-
-Outputs `.srt` (subtitles) and `.txt` (plain text). Model weights download automatically on first run.
-
-## Performance
-
-MacBook Pro M2 Max, 20-second audio chunk (avg of 3 runs, warmed up):
-
-| Backend | Model | Time | Realtime factor |
-|---|---|---|---|
-| **MLX (this)** | **v3_e2e_ctc** | **0.06s** | **~330x** |
-| **MLX (this)** | **v3_e2e_rnnt** | **0.26s** | **~77x** |
-| PyTorch MPS | v3_e2e_rnnt | 0.76s | ~26x |
-| PyTorch CPU | v3_e2e_rnnt | 1.13s | ~18x |
-| ONNX CPU | v3_e2e_ctc | 1.66s | ~12x |
-
-Full 18-minute video: CTC **21.5s** (~50x realtime), RNNT **25.0s** (~42x realtime).
-
-Those are upstream's single-chunk figures. For long files this fork is substantially faster —
-a 52-minute recording with RNNT runs in ~14s (~220x realtime) instead of ~56s. See
-[Changes in this fork](#changes-in-this-fork).
-
-## Changes in this fork
+> Fork of [aystream/gigaam-mlx](https://github.com/aystream/gigaam-mlx) — **~4x faster on
+> long files, with bounded memory**
 
 Upstream is tuned for single short clips. On a full-length recording split into hundreds of
 chunks, two things go wrong: memory grows without bound, and the RNNT decode dominates the
 runtime. This fork fixes both. **Every change is verified to leave the transcript byte-identical**
 on a 52-minute call (191 segments, 4572 words).
+
+| | upstream | this fork |
+|---|---|---|
+| 52-min recording (RNNT) | ~56s (55x realtime) | **~14s (~220x realtime)** |
+| Peak memory over that run | ~49 GB | **~2 GB** |
+| Transcript | — | byte-identical |
+
+```bash
+pip install git+https://github.com/IlyaGulya/gigaam-mlx.git
+```
+
+The API is unchanged, so this is a drop-in replacement for upstream.
+
+## What this fork changes
 
 ### Memory: bounded buffer cache
 
@@ -162,6 +118,59 @@ All measured, none kept. Recorded here so they don't get re-attempted:
 
 The encoder is ~75% of the remaining runtime and its GEMMs already run at ~60% of the machine's
 fp32 peak, which is near the practical ceiling for these shapes.
+
+---
+
+*Everything below is upstream's documentation.*
+
+## About
+
+MLX port of [GigaAM-v3](https://github.com/salute-developers/GigaAM) (220M params, Conformer + CTC/RNNT) by Salute Developers. Produces **punctuated, normalized text** directly. No PyTorch required.
+
+<p align="center">
+  <img src="assets/benchmark.svg" alt="Benchmark comparison" width="600">
+</p>
+
+## Quick Start
+
+```python
+from gigaam_mlx import load_model, transcribe
+
+model, tokenizer = load_model()  # auto-downloads from HuggingFace
+text = transcribe(model, tokenizer, "meeting.wav")
+print(text)
+```
+
+## CLI
+
+```bash
+# Transcribe any audio/video file (CTC — fast, default)
+gigaam-mlx recording.mkv
+
+# Use RNNT for higher quality
+gigaam-mlx recording.mkv --model-type rnnt
+
+# Output subtitles
+gigaam-mlx call.wav --output-dir ./transcripts --format srt
+```
+
+Outputs `.srt` (subtitles) and `.txt` (plain text). Model weights download automatically on first run.
+
+## Performance
+
+MacBook Pro M2 Max, 20-second audio chunk (avg of 3 runs, warmed up):
+
+| Backend | Model | Time | Realtime factor |
+|---|---|---|---|
+| **MLX (this)** | **v3_e2e_ctc** | **0.06s** | **~330x** |
+| **MLX (this)** | **v3_e2e_rnnt** | **0.26s** | **~77x** |
+| PyTorch MPS | v3_e2e_rnnt | 0.76s | ~26x |
+| PyTorch CPU | v3_e2e_rnnt | 1.13s | ~18x |
+| ONNX CPU | v3_e2e_ctc | 1.66s | ~12x |
+
+Full 18-minute video: CTC **21.5s** (~50x realtime), RNNT **25.0s** (~42x realtime).
+
+These are single-chunk figures; for long files see the fork section above.
 
 ## Model variants
 
