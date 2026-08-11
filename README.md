@@ -11,6 +11,10 @@
 
 MLX port of [GigaAM-v3](https://github.com/salute-developers/GigaAM) (220M params, Conformer + CTC/RNNT) by Salute Developers. Produces **punctuated, normalized text** directly. No PyTorch required.
 
+> **This is a fork of [aystream/gigaam-mlx](https://github.com/aystream/gigaam-mlx)** that bounds MLX's
+> buffer cache and speeds up long-file transcription by ~4x. Transcripts are byte-identical to
+> upstream's. See [Changes in this fork](#changes-in-this-fork).
+
 <p align="center">
   <img src="assets/benchmark.svg" alt="Benchmark comparison" width="600">
 </p>
@@ -18,7 +22,7 @@ MLX port of [GigaAM-v3](https://github.com/salute-developers/GigaAM) (220M param
 ## Quick Start
 
 ```bash
-pip install git+https://github.com/aystream/gigaam-mlx.git
+pip install git+https://github.com/IlyaGulya/gigaam-mlx.git
 ```
 
 ```python
@@ -57,6 +61,107 @@ MacBook Pro M2 Max, 20-second audio chunk (avg of 3 runs, warmed up):
 | ONNX CPU | v3_e2e_ctc | 1.66s | ~12x |
 
 Full 18-minute video: CTC **21.5s** (~50x realtime), RNNT **25.0s** (~42x realtime).
+
+Those are upstream's single-chunk figures. For long files this fork is substantially faster —
+a 52-minute recording with RNNT runs in ~14s (~220x realtime) instead of ~56s. See
+[Changes in this fork](#changes-in-this-fork).
+
+## Changes in this fork
+
+Upstream is tuned for single short clips. On a full-length recording split into hundreds of
+chunks, two things go wrong: memory grows without bound, and the RNNT decode dominates the
+runtime. This fork fixes both. **Every change is verified to leave the transcript byte-identical**
+on a 52-minute call (191 segments, 4572 words).
+
+### Memory: bounded buffer cache
+
+MLX keeps freed Metal buffers in an unbounded pool. Transcribing chunk after chunk accumulates
+them for the whole file — about 0.25 GB per chunk, reaching **27 GB by chunk 100 and 49 GB by the
+end of a 52-minute file**. This memory is reclaimable rather than leaked, so it never triggers an
+OOM, but it counts toward the process footprint and drives system-wide memory pressure.
+
+It is also invisible to the usual tools: `ps` RSS stays flat at ~1.5 GB because unified-memory
+Metal buffers are not counted there. Activity Monitor's "Memory" column does show it.
+
+`load_model` now calls `mx.set_cache_limit(2 GB)`. Peak usage within a single chunk is ~1.7 GB, so
+a 2 GB cap preserves buffer reuse inside a chunk while dropping the cross-chunk accumulation.
+The limit lives in `load_model` rather than `transcribe_file` so that callers driving
+`model.encode` / `model.decode` directly are covered too.
+
+```python
+load_model(cache_limit=None)             # opt out, restore upstream behaviour
+transcribe_file(path, cache_limit=None)  # same, via the API
+load_model(cache_limit=4 * 1024**3)      # or pick your own cap, in bytes
+```
+
+```bash
+gigaam-mlx recording.mkv --cache-limit-gb 4   # 0 disables the cap
+```
+
+### Speed: ~4x faster on long files
+
+Measured on a 52-minute recording (203 chunks), M1 Max, RNNT:
+
+| Stage | Wall | RTF | Decode |
+|---|---|---|---|
+| upstream | ~56s | 55x | 42.1s |
+| + CPU-stream decode, no log_softmax | 30.1s | 103x | 13.5s |
+| + encoder projection hoisted | 22.0s | 141x | 8.3s |
+| + NumPy decode loop | 17.3s | 178x | 2.7s |
+| + mel filterbank cache | 15.4s | 200x | 2.2s |
+| + attention and depthwise conv | ~14s | ~220x | 2.2s |
+
+**RNNT decode (42.1s → 2.2s, 19x).** The greedy loop ran on the GPU one token at a time, so every
+step paid a GPU sync to read back a single argmax. It now runs entirely in NumPy on the CPU:
+blank runs are decoded as batched spans instead of step-by-step, the joint network's encoder
+projection is computed once per chunk instead of per step, and `log_softmax` is skipped since
+greedy argmax is invariant to it.
+
+**Mel spectrogram.** `librosa.feature.melspectrogram` rebuilds the filterbank and window on every
+call, which dominates the cost for short chunks. Both are now cached per sample rate and the STFT
+is done directly with a strided view.
+
+**Attention.** Each Conformer layer normalized the same residual three times to feed q, k and v,
+and the attention block routed all three through a `(T, B, H, D)` transpose pair just to apply
+RoPE. Since q and k are the same tensor in self-attention and v is never rotated, one
+normalization and one rotation suffice, applied in place on `(B, T, D)`.
+
+**Depthwise convolution — custom Metal kernel.** MLX routes `nn.Conv1d` with `groups == channels`
+through its general grouped-convolution path, which suits this shape badly: the k=5 depthwise does
+**154x fewer FLOPs** than a 1x1 pointwise conv over the same tensor yet takes just as long,
+running ~5x off the bandwidth bound. A plain 1D stencil written with `mx.fast.metal_kernel` is
+2.5–3.4x faster in isolation and bit-identical — the five taps accumulate in the same order. It
+falls back to `nn.Conv1d` when custom Metal kernels are unavailable or the input is not float32.
+
+### Notes on measurement
+
+Wall-clock numbers on Apple Silicon vary a lot with thermal state — the same run measured
+anywhere from 14s to 23s on the same machine within one session. Comparisons above are best-of-N
+A/B pairs taken within a single process, which is the only way to get a clean signal. Treat the
+absolute figures as indicative and the ratios as meaningful.
+
+### Approaches that were tried and rejected
+
+All measured, none kept. Recorded here so they don't get re-attempted:
+
+| Idea | Result |
+|---|---|
+| fp16 / bf16 | 0.87x / 0.85x, plus token drift |
+| `mx.fast.scaled_dot_product_attention` | 0.31x |
+| `mx.compile` | 1.05x steady-state, but 203 distinct shapes force a 1.5s recompile each |
+| Padding mel length to a grid (64/256) | 0.71x / 0.95x, and breaks output without attention masking |
+| `mx.async_eval` | 0.67x |
+| Dropping `mx.eval` between encode and decode | 14% slower |
+| Overlapping CPU phases with GPU via threads | 1.00x — the GPU is the critical path throughout |
+| Batching chunks along the batch axis | 1.07–1.11x, costs streaming and bit-identity |
+| Longer chunks (30s) | 0.73x and loses 1.6% of words |
+| Shorter chunks (8–15s) | within noise; per-chunk overhead cancels the quadratic attention saving |
+| Pre-scaling q instead of the scores | 1.58x in isolation, 1.00x in the real graph |
+| Caching the RoPE tables | no measurable effect |
+| Quantization | not attempted — deliberately out of scope for this fork |
+
+The encoder is ~75% of the remaining runtime and its GEMMs already run at ~60% of the machine's
+fp32 peak, which is near the practical ceiling for these shapes.
 
 ## Model variants
 
