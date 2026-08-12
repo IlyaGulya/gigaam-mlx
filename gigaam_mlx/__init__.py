@@ -1,8 +1,12 @@
 """GigaAM-MLX: Fast Russian speech recognition on Apple Silicon."""
 
+from .audio import SAMPLE_RATE as SAMPLE_RATE
 from .audio import compute_mel, load_audio
 from .model import DEFAULT_CACHE_LIMIT, GigaAMMLX
 from .model import FRAME_DURATION_S as FRAME_DURATION_S
+from .transcribe import DecodedChunk as DecodedChunk
+from .transcribe import iter_decode_audio as iter_decode_audio
+from .transcribe import transcribe_audio as transcribe_audio
 from .transcribe import transcribe_file as transcribe_file
 
 __version__ = "0.1.0"

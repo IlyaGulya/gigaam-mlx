@@ -78,6 +78,74 @@ An emission frame is the point where greedy CTC or RNNT decoding emits a token. 
 RNNT emission can lag slightly behind the token's acoustic onset; this is expected decoder
 behavior rather than timestamp error.
 
+### Long-running daemon use
+
+Load one model when the daemon starts and serialize access to it. Concurrent requests on the
+same MLX model increase memory pressure and latency rather than GPU throughput; a dedicated
+worker with `max_workers=1` gives predictable request ordering. `load_audio` accepts limits for
+untrusted files, while `iter_decode_audio` yields after each chunk so a worker can report
+progress or honor cancellation before starting the next chunk.
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
+
+from gigaam_mlx import (
+    FRAME_DURATION_S,
+    iter_decode_audio,
+    load_audio,
+    load_model,
+)
+
+model, tokenizer = load_model("rnnt")  # once, during daemon startup
+inference_worker = ThreadPoolExecutor(max_workers=1)
+
+
+def transcribe_request(path: str, cancelled: Event) -> list[dict]:
+    audio = load_audio(
+        path,
+        timeout_s=120,
+        max_duration_s=60 * 60,
+        max_input_bytes=2 * 1024**3,
+    )
+
+    chunks = []
+    decoded_chunks = iter_decode_audio(audio, model)
+    while not cancelled.is_set():
+        try:
+            chunk = next(decoded_chunks)
+        except StopIteration:
+            break
+        if cancelled.is_set():
+            break
+
+        token_ids = [token_id for token_id, _ in chunk.emissions]
+        chunks.append({
+            "start": chunk.start,
+            "end": chunk.end,
+            "text": tokenizer.decode(token_ids),
+            "emissions": [
+                {
+                    "token_id": token_id,
+                    "time": chunk.start + frame * FRAME_DURATION_S,
+                }
+                for token_id, frame in chunk.emissions
+            ],
+        })
+    return chunks
+
+
+cancelled = Event()
+future = inference_worker.submit(transcribe_request, "request.m4a", cancelled)
+# cancelled.set()  # takes effect between encoded chunks
+result = future.result()
+```
+
+If the daemon already receives decoded audio, skip ffmpeg and call
+`transcribe_audio(audio, model, tokenizer)` directly. The array must be mono PCM with shape
+`(samples,)`, normalized to `[-1, 1]`, at the exported `SAMPLE_RATE` (`16000`). The returned
+segment shape is identical to `transcribe_file`: `{"start", "end", "text"}`.
+
 ### Speed: ~4x faster on long files
 
 Measured on a 52-minute recording (203 chunks), M1 Max, RNNT:
@@ -100,6 +168,11 @@ greedy argmax is invariant to it.
 **Mel spectrogram.** `librosa.feature.melspectrogram` rebuilds the filterbank and window on every
 call, which dominates the cost for short chunks. Both are now cached per sample rate and the STFT
 is done directly with a strided view.
+
+**Silence splitting.** The original sliding-energy calculation used a 4,800-sample convolution
+at every candidate position. A prefix sum now finds the approximate minimum in linear time, then
+a tiny convolution around it retains the old calculation near that minimum. On a 49-minute
+recording, splitting dropped from 22.9s to 0.17s with all 193 sample boundaries unchanged.
 
 **Attention.** Each Conformer layer normalized the same residual three times to feed q, k and v,
 and the attention block routed all three through a `(T, B, H, D)` transpose pair just to apply

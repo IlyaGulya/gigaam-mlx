@@ -3,13 +3,105 @@
 import argparse
 import os
 import time
-from typing import Optional
+from dataclasses import dataclass
+from typing import Iterator, Optional
 
 import mlx.core as mx
 import numpy as np
 
-from .audio import compute_mel, load_audio, split_audio
+from .audio import SAMPLE_RATE, compute_mel, load_audio, split_audio
 from .model import DEFAULT_CACHE_LIMIT, GigaAMMLX
+
+
+@dataclass(frozen=True)
+class DecodedChunk:
+    """Token emissions and source boundaries for one decoded audio chunk."""
+
+    start: float
+    end: float
+    emissions: list[tuple[int, int]]
+
+
+def _validate_audio(audio: np.ndarray) -> None:
+    if not isinstance(audio, np.ndarray):
+        raise TypeError("audio must be a NumPy array")
+    if audio.ndim != 1:
+        raise ValueError("audio must be mono PCM with shape (samples,)")
+
+
+def _decode_chunks(
+    audio: np.ndarray,
+    model: GigaAMMLX,
+    chunks: list[dict],
+) -> Iterator[DecodedChunk]:
+    for chunk in chunks:
+        chunk_audio = audio[chunk["start_sample"]:chunk["end_sample"]]
+        mel = compute_mel(chunk_audio)
+        encoded, seq_len = model.encode(mx.array(mel[np.newaxis]))
+        mx.eval(encoded)
+        emissions = model.decode_with_frames(encoded, seq_len)
+        yield DecodedChunk(
+            start=chunk["start_sec"],
+            end=chunk["end_sec"],
+            emissions=emissions,
+        )
+
+
+def iter_decode_audio(
+    audio: np.ndarray,
+    model: GigaAMMLX,
+    *,
+    max_chunk_sec: float = 20.0,
+) -> Iterator[DecodedChunk]:
+    """Decode 16kHz mono PCM lazily, yielding one chunk at a time."""
+    _validate_audio(audio)
+    chunks = split_audio(audio, max_chunk_sec=max_chunk_sec, sr=SAMPLE_RATE)
+    return _decode_chunks(audio, model, chunks)
+
+
+def transcribe_audio(
+    audio: np.ndarray,
+    model: GigaAMMLX,
+    tokenizer,
+    *,
+    verbose: bool = True,
+    max_chunk_sec: float = 20.0,
+) -> list[dict]:
+    """Transcribe mono float PCM at ``SAMPLE_RATE`` supplied by the caller."""
+    _validate_audio(audio)
+
+    def log(msg):
+        if verbose:
+            print(msg, flush=True)
+
+    started = time.perf_counter()
+    log(f"Audio: {len(audio) / SAMPLE_RATE:.1f}s")
+    chunks = split_audio(audio, max_chunk_sec=max_chunk_sec, sr=SAMPLE_RATE)
+    log(f"Split into {len(chunks)} chunks")
+
+    segments = []
+    for index, decoded in enumerate(_decode_chunks(audio, model, chunks)):
+        token_ids = [token_id for token_id, _ in decoded.emissions]
+        text = tokenizer.decode(token_ids)
+
+        if text.strip():
+            segment = {
+                "start": decoded.start,
+                "end": decoded.end,
+                "text": text,
+            }
+            segments.append(segment)
+            log(
+                f"  [{format_srt_time(segment['start'])} -> "
+                f"{format_srt_time(segment['end'])}] {text}"
+            )
+
+        if verbose and (index + 1) % 10 == 0:
+            log(f"  ... {index + 1}/{len(chunks)} chunks")
+
+    elapsed = time.perf_counter() - started
+    log(f"Transcribed in {elapsed:.1f}s ({len(segments)} segments)")
+    return segments
 
 
 def format_srt_time(seconds: float) -> str:
@@ -39,6 +131,9 @@ def transcribe_file(
     repo_id: Optional[str] = None,
     verbose: bool = True,
     cache_limit: Optional[int] = DEFAULT_CACHE_LIMIT,
+    load_timeout_s: Optional[float] = None,
+    max_duration_s: Optional[float] = None,
+    max_input_bytes: Optional[int] = None,
 ) -> list[dict]:
     """
     Transcribe an audio or video file.
@@ -52,6 +147,9 @@ def transcribe_file(
         verbose: Print progress
         cache_limit: Cap MLX's buffer cache, in bytes. Pass None to leave
             MLX's default (unbounded) behaviour untouched.
+        load_timeout_s: Optional ffmpeg timeout in seconds.
+        max_duration_s: Reject decoded audio longer than this many seconds.
+        max_input_bytes: Reject input files larger than this many bytes.
 
     Returns:
         List of segments with 'start', 'end', 'text' keys
@@ -70,42 +168,15 @@ def transcribe_file(
         mx.set_cache_limit(cache_limit)
 
     log(f"Loading audio: {os.path.basename(audio_path)}")
-    audio = load_audio(audio_path)
-    log(f"Audio: {len(audio) / 16000:.1f}s")
-
-    chunks = split_audio(audio)
-    log(f"Split into {len(chunks)} chunks")
-
-    t0 = time.time()
-    segments = []
-    for i, chunk in enumerate(chunks):
-        chunk_audio = audio[chunk["start_sample"]:chunk["end_sample"]]
-        mel = compute_mel(chunk_audio)
-        mel_mx = mx.array(mel[np.newaxis])
-
-        encoded, seq_len = model.encode(mel_mx)
-        mx.eval(encoded)
-        token_ids = model.decode(encoded, seq_len)
-        text = tokenizer.decode(token_ids)
-
-        if text.strip():
-            seg = {
-                "start": chunk["start_sec"],
-                "end": chunk["end_sec"],
-                "text": text,
-            }
-            segments.append(seg)
-            log(
-                f"  [{format_srt_time(seg['start'])} -> "
-                f"{format_srt_time(seg['end'])}] {text}"
-            )
-
-        if verbose and (i + 1) % 10 == 0:
-            log(f"  ... {i + 1}/{len(chunks)} chunks")
-
-    elapsed = time.time() - t0
-    log(f"Transcribed in {elapsed:.1f}s ({len(segments)} segments)")
-    return segments
+    audio = load_audio(
+        audio_path,
+        timeout_s=load_timeout_s,
+        max_duration_s=max_duration_s,
+        max_input_bytes=max_input_bytes,
+    )
+    return transcribe_audio(
+        audio, model=model, tokenizer=tokenizer, verbose=verbose
+    )
 
 
 def main():
