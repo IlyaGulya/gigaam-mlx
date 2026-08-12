@@ -21,8 +21,14 @@ class DecodeFramesTest(unittest.TestCase):
         labels = [3, 1, 1, 3, 1, 2, 2, 3, 0]
         logits = np.full((1, len(labels), 4), -1.0, dtype=np.float32)
         logits[0, np.arange(len(labels)), labels] = 1.0
+        normalize_values = []
+
+        def head(encoded, normalize=True):
+            normalize_values.append(normalize)
+            return mx.array(logits)
+
         model = SimpleNamespace(
-            head=lambda encoded: mx.array(logits),
+            head=head,
             num_classes=4,
         )
         encoded = mx.zeros((1, 1, len(labels)))
@@ -37,6 +43,7 @@ class DecodeFramesTest(unittest.TestCase):
         self.assertEqual(framed_tokens, tokens)
         self.assertEqual(framed, [(1, 1), (1, 4), (2, 5), (0, 8)])
         self.assertEqual(tokens, [token for token, _ in framed])
+        self.assertEqual(normalize_values, [False, False])
 
     def test_public_decode_methods_have_unambiguous_results(self):
         calls = []

@@ -285,9 +285,15 @@ class CTCHead(nn.Module):
         super().__init__()
         self.decoder_layers = nn.Conv1d(feat_in, num_classes, kernel_size=1)
 
-    def __call__(self, encoder_output: mx.array) -> mx.array:
+    def __call__(
+        self, encoder_output: mx.array, normalize: bool = True
+    ) -> mx.array:
         x = mx.transpose(encoder_output, (0, 2, 1))
         logits = self.decoder_layers(x)
+        if not normalize:
+            # Greedy decoding only takes an argmax, which log_softmax leaves
+            # unchanged — so skip the reduction over all 257 classes.
+            return logits
         return logits - mx.logsumexp(logits, axis=-1, keepdims=True)
 
 
@@ -398,9 +404,8 @@ class GigaAMMLX(nn.Module):
         token_frames: Optional[List[Tuple[int, int]]] = None,
     ) -> List[int]:
         """CTC greedy decoding — fully vectorized."""
-        log_probs = self.head(encoded)
-        labels = mx.argmax(log_probs[0, :seq_len, :], axis=-1)
-        mx.eval(labels)
+        logits = self.head(encoded, normalize=False)
+        labels = mx.argmax(logits[0, :seq_len, :], axis=-1)
 
         blank_id = self.num_classes - 1
         token_ids: List[int] = []
