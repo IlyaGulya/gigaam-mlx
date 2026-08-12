@@ -1,8 +1,9 @@
 """GigaAM-MLX: Fast Russian speech recognition on Apple Silicon."""
 
-from .model import GigaAMMLX, DEFAULT_CACHE_LIMIT
-from .audio import load_audio, compute_mel
-from .transcribe import transcribe_file
+from .audio import compute_mel, load_audio
+from .model import DEFAULT_CACHE_LIMIT, GigaAMMLX
+from .model import FRAME_DURATION_S as FRAME_DURATION_S
+from .transcribe import transcribe_file as transcribe_file
 
 __version__ = "0.1.0"
 
@@ -32,6 +33,7 @@ def load_model(
         tuple: (model, tokenizer)
     """
     import os
+
     import mlx.core as mx
     from sentencepiece import SentencePieceProcessor
 

@@ -54,6 +54,30 @@ load_model(cache_limit=4 * 1024**3)      # or pick your own cap, in bytes
 gigaam-mlx recording.mkv --cache-limit-gb 4   # 0 disables the cap
 ```
 
+### Token emission frames
+
+`decode_with_frames` returns the encoder frame where each token was emitted as
+`(token_id, frame_index)` pairs. The existing `decode` method remains unchanged:
+
+```python
+from gigaam_mlx import FRAME_DURATION_S
+
+token_ids = model.decode(encoded, seq_len)
+tokens_with_frames = model.decode_with_frames(encoded, seq_len)
+
+for token_id, frame_index in tokens_with_frames:
+    emission_time = frame_index * FRAME_DURATION_S
+```
+
+Frame indices are zero-based and local to the encoded chunk. One encoder frame is 40 ms: the
+mel spectrogram uses a 160-sample hop at 16 kHz (10 ms), followed by two stride-2 convolutions
+for 4x subsampling. `FRAME_DURATION_S` exports this interval as `0.04` so callers do not need to
+derive it from the architecture.
+
+An emission frame is the point where greedy CTC or RNNT decoding emits a token. In particular,
+RNNT emission can lag slightly behind the token's acoustic onset; this is expected decoder
+behavior rather than timestamp error.
+
 ### Speed: ~4x faster on long files
 
 Measured on a 52-minute recording (203 chunks), M1 Max, RNNT:

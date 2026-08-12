@@ -7,7 +7,6 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-
 # MLX keeps freed Metal buffers in an unbounded pool by default, so chunked
 # transcription accumulates them for the whole file: ~0.25GB per chunk, 27GB
 # by chunk 100 of a 52-minute recording. That memory is reclaimable rather
@@ -17,6 +16,9 @@ import numpy as np
 # Peak usage within a single chunk is ~1.7GB, so a 2GB cache preserves buffer
 # reuse inside a chunk while dropping the cross-chunk accumulation.
 DEFAULT_CACHE_LIMIT = 2 * 1024**3
+
+# A 10 ms mel hop followed by the encoder's 4x convolutional subsampling.
+FRAME_DURATION_S = 0.04
 
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:
@@ -380,24 +382,41 @@ class GigaAMMLX(nn.Module):
             return self._ctc_decode(encoded, seq_len)
         return self._rnnt_decode(encoded, seq_len)
 
-    def _ctc_decode(self, encoded: mx.array, seq_len: int) -> List[int]:
+    def decode_with_frames(
+        self, encoded: mx.array, seq_len: int,
+    ) -> List[Tuple[int, int]]:
+        """Decode token IDs paired with zero-based encoder emission frames."""
+        token_frames: List[Tuple[int, int]] = []
+        if self.model_type == "ctc":
+            self._ctc_decode(encoded, seq_len, token_frames=token_frames)
+        else:
+            self._rnnt_decode(encoded, seq_len, token_frames=token_frames)
+        return token_frames
+
+    def _ctc_decode(
+        self, encoded: mx.array, seq_len: int,
+        token_frames: Optional[List[Tuple[int, int]]] = None,
+    ) -> List[int]:
         """CTC greedy decoding — fully vectorized."""
         log_probs = self.head(encoded)
         labels = mx.argmax(log_probs[0, :seq_len, :], axis=-1)
         mx.eval(labels)
 
         blank_id = self.num_classes - 1
-        token_ids = []
+        token_ids: List[int] = []
         prev = blank_id
-        for tok in labels.tolist():
+        for frame, tok in enumerate(labels.tolist()):
             if tok != blank_id and tok != prev:
                 token_ids.append(tok)
+                if token_frames is not None:
+                    token_frames.append((tok, frame))
             prev = tok
         return token_ids
 
     def _rnnt_decode(
         self, encoded: mx.array, seq_len: int, max_symbols: int = 10,
         lookahead: int = 32,
+        token_frames: Optional[List[Tuple[int, int]]] = None,
     ) -> List[int]:
         """
         RNNT greedy decoding.
@@ -472,6 +491,8 @@ class GigaAMMLX(nn.Module):
             t += offset
             k = int(preds[offset])
             hyp.append(k)
+            if token_frames is not None:
+                token_frames.append((k, t))
             h, c = h_next, c_next
             emb = w["embed"][k]
             pred_p, h_next, c_next = predict(emb, h, c)
@@ -483,6 +504,8 @@ class GigaAMMLX(nn.Module):
                 if k == blank_id:
                     break
                 hyp.append(k)
+                if token_frames is not None:
+                    token_frames.append((k, t))
                 h, c = h_next, c_next
                 emb = w["embed"][k]
                 pred_p, h_next, c_next = predict(emb, h, c)
